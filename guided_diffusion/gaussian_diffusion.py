@@ -265,7 +265,10 @@ class GaussianDiffusion:
 
         B, C = x.shape[:2]
         assert t.shape == (B,)
-        model_output = model(th.cat([x, cond_x], dim=1), self._scale_timesteps(t), **model_kwargs)
+        if cond_x is not None:
+            model_output = model(th.cat([x, cond_x], dim=1), self._scale_timesteps(t), **model_kwargs)
+        else:
+            model_output = model(x, self._scale_timesteps(t), **model_kwargs)
 
         if self.model_var_type in [ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE]:
             assert model_output.shape == (B, C * 2, *x.shape[2:])
