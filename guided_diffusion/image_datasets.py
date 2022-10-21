@@ -1,3 +1,4 @@
+import os
 import math
 import random
 
@@ -79,12 +80,66 @@ def _list_image_files_recursively(data_dir):
     return results
 
 
+def load_dg_data(
+    *,
+    root,
+    envs,
+    batch_size,
+    image_size,
+    deterministic=False,
+    random_crop=False,
+    random_flip=True
+):
+    """
+    Load Domain Generalization datasets.
+    """
+    all_files = []
+    all_classes = []
+    all_domains = []
+
+    for env_id, env in enumerate(envs):
+        env_dir = os.path.join(root, env)
+        classes = sorted(os.listdir(env_dir))
+        for class_id, _class in enumerate(classes):
+            img_dir = os.path.join(env_dir, _class)
+            files = os.listdir(img_dir)
+            for file in files:
+                path = os.path.join(img_dir, file)
+                if path.lower().endswith(("jpg", "jpeg", "png", "gif")):
+                    all_files.append(path)
+                    all_classes.append(class_id)
+                    all_domains.append(env_id)
+    
+    dataset = ImageDataset(
+        image_size,
+        all_files,
+        classes=all_classes,
+        domains=all_domains,
+        shard=MPI.COMM_WORLD.Get_rank(),
+        num_shards=MPI.COMM_WORLD.Get_size(),
+        random_crop=random_crop,
+        random_flip=random_flip,
+    )
+
+    if deterministic:
+        loader = DataLoader(
+            dataset, batch_size=batch_size, shuffle=False, num_workers=1, drop_last=True
+        )
+    else:
+        loader = DataLoader(
+            dataset, batch_size=batch_size, shuffle=True, num_workers=1, drop_last=True
+        )
+    while True:
+        yield from loader
+
+
 class ImageDataset(Dataset):
     def __init__(
         self,
         resolution,
         image_paths,
         classes=None,
+        domains=None,
         shard=0,
         num_shards=1,
         random_crop=False,
@@ -94,6 +149,7 @@ class ImageDataset(Dataset):
         self.resolution = resolution
         self.local_images = image_paths[shard:][::num_shards]
         self.local_classes = None if classes is None else classes[shard:][::num_shards]
+        self.local_domains = domains
         self.random_crop = random_crop
         self.random_flip = random_flip
 
@@ -120,6 +176,7 @@ class ImageDataset(Dataset):
         out_dict = {}
         if self.local_classes is not None:
             out_dict["y"] = np.array(self.local_classes[idx], dtype=np.int64)
+            out_dict["d"] = np.array(self.local_domains[idx], dtype=np.int64)
         return np.transpose(arr, [2, 0, 1]), out_dict
 
 

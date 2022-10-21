@@ -170,6 +170,13 @@ class TrainLoop:
             self.save()
 
     def run_step(self, batch, cond):
+        """
+        Args:
+            batch (tensor): Tensor of shape (b, c, h, w)
+            cond (dict): cond is the dict generated according to your dataset,
+                cond contains keys defined in your dataset, such as "y" and "d".
+                Each value in cond is a tensor of size b.
+        """
         self.forward_backward(batch, cond)
         took_step = self.mp_trainer.optimize(self.opt)
         if took_step:
@@ -180,6 +187,7 @@ class TrainLoop:
     def forward_backward(self, batch, cond):
         self.mp_trainer.zero_grad()
         for i in range(0, batch.shape[0], self.microbatch):
+            # NOTE: Seperate a batch of data into self.microbatch parts.
             micro = batch[i : i + self.microbatch].to(dist_util.dev())
             micro_cond = {
                 k: v[i : i + self.microbatch].to(dist_util.dev())

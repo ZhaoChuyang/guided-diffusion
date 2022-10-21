@@ -123,7 +123,15 @@ class GaussianDiffusion:
         model_var_type,
         loss_type,
         rescale_timesteps=False,
+        conditional=False,
     ):
+        """
+        Args:
+            loss_type: by default the loss to use is MSE.
+            model_mean_type: what to predict. Three choices: noise, x_start, x_previous, by default is noise.
+
+        """
+        self.conditional = conditional
         self.model_mean_type = model_mean_type
         self.model_var_type = model_var_type
         self.loss_type = loss_type
@@ -230,7 +238,7 @@ class GaussianDiffusion:
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
     def p_mean_variance(
-        self, model, x, t, clip_denoised=True, denoised_fn=None, model_kwargs=None
+        self, model, x, t, cond_x=None, clip_denoised=True, denoised_fn=None, model_kwargs=None
     ):
         """
         Apply the model to get p(x_{t-1} | x_t), as well as a prediction of
@@ -257,7 +265,7 @@ class GaussianDiffusion:
 
         B, C = x.shape[:2]
         assert t.shape == (B,)
-        model_output = model(x, self._scale_timesteps(t), **model_kwargs)
+        model_output = model(th.cat([x, cond_x], dim=1), self._scale_timesteps(t), **model_kwargs)
 
         if self.model_var_type in [ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE]:
             assert model_output.shape == (B, C * 2, *x.shape[2:])
@@ -306,6 +314,7 @@ class GaussianDiffusion:
             if self.model_mean_type == ModelMeanType.START_X:
                 pred_xstart = process_xstart(model_output)
             else:
+                
                 pred_xstart = process_xstart(
                     self._predict_xstart_from_eps(x_t=x, t=t, eps=model_output)
                 )
@@ -397,6 +406,7 @@ class GaussianDiffusion:
         model,
         x,
         t,
+        cond_x=None,
         clip_denoised=True,
         denoised_fn=None,
         cond_fn=None,
@@ -423,6 +433,7 @@ class GaussianDiffusion:
             model,
             x,
             t,
+            cond_x=cond_x,
             clip_denoised=clip_denoised,
             denoised_fn=denoised_fn,
             model_kwargs=model_kwargs,
@@ -443,6 +454,7 @@ class GaussianDiffusion:
         model,
         shape,
         noise=None,
+        cond_x=None,
         clip_denoised=True,
         denoised_fn=None,
         cond_fn=None,
@@ -474,6 +486,7 @@ class GaussianDiffusion:
             model,
             shape,
             noise=noise,
+            cond_x=cond_x,
             clip_denoised=clip_denoised,
             denoised_fn=denoised_fn,
             cond_fn=cond_fn,
@@ -489,6 +502,7 @@ class GaussianDiffusion:
         model,
         shape,
         noise=None,
+        cond_x=None,
         clip_denoised=True,
         denoised_fn=None,
         cond_fn=None,
@@ -513,6 +527,11 @@ class GaussianDiffusion:
             img = th.randn(*shape, device=device)
         indices = list(range(self.num_timesteps))[::-1]
 
+        if cond_x is not None:
+            cond_x = self.add_noise(cond_x, level=500)
+            cond_x = cond_x.to(img.device)
+            # img = th.cat([img, cond_x], dim=1)
+
         if progress:
             # Lazy import so that we don't depend on tqdm.
             from tqdm.auto import tqdm
@@ -526,6 +545,7 @@ class GaussianDiffusion:
                     model,
                     img,
                     t,
+                    cond_x=cond_x,
                     clip_denoised=clip_denoised,
                     denoised_fn=denoised_fn,
                     cond_fn=cond_fn,
@@ -741,6 +761,19 @@ class GaussianDiffusion:
         output = th.where((t == 0), decoder_nll, kl)
         return {"output": output, "pred_xstart": out["pred_xstart"]}
 
+    # NOTE: check the grad of the input x
+    def add_noise(self, x, level=500):
+        """
+        Adding specified level noise to x the same way as the diffusion process.
+        """
+        b = x.shape[0]
+        # t: (b)
+        t = th.fill(th.empty(b), level).long().to(x.device)
+        noise = th.randn_like(x)
+        noisy_image = _extract_into_tensor(self.sqrt_alphas_cumprod, t, x.shape) * x + \
+            _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x.shape) * noise
+        return noisy_image
+
     def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
         """
         Compute training losses for a single timestep.
@@ -752,16 +785,19 @@ class GaussianDiffusion:
             pass to the model. This can be used for conditioning.
         :param noise: if specified, the specific Gaussian noise to try to remove.
         :return: a dict with the key "loss" containing a tensor of shape [N].
-                 Some mean or variance settings may also have other keys.
+            Some mean or variance settings may also have other keys.
         """
         if model_kwargs is None:
             model_kwargs = {}
         if noise is None:
             noise = th.randn_like(x_start)
+        
+        # x_t is the corrupted image computed based on `noise` at timestep t in the forward process.
         x_t = self.q_sample(x_start, t, noise=noise)
 
         terms = {}
 
+        # NOTE: Currently only support calculate the MSE loss between model's prediction and the noise added.
         if self.loss_type == LossType.KL or self.loss_type == LossType.RESCALED_KL:
             terms["loss"] = self._vb_terms_bpd(
                 model=model,
@@ -774,7 +810,38 @@ class GaussianDiffusion:
             if self.loss_type == LossType.RESCALED_KL:
                 terms["loss"] *= self.num_timesteps
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
-            model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
+            """
+            To make the model condition on the corrupted image x_t', we concatenate x_t' with x_t,
+            which is the denoised x at timestep t.
+            """
+
+            # FIXME: only for DG experiments
+            if self.conditional:
+                model_kwargs = {}
+                x_c = self.add_noise(x_start.clone(), level=300)
+                x_in = th.cat([x_t, x_c], dim=1)
+                model_output = model(x_in, self._scale_timesteps(t), **model_kwargs)
+            else:
+                model_kwargs = {}
+                model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
+
+            # NOTE: for debug only
+            # def save_image(name, inputs):
+            #     import numpy as np
+            #     import cv2
+            #     inputs = inputs.detach().cpu().numpy()
+            #     b = inputs.shape[0]
+            #     for i in range(b):
+            #         input = inputs[i]
+            #         input = np.transpose(input, (1, 2, 0))
+            #         input = cv2.cvtColor(input, cv2.COLOR_BGR2RGB)
+            #         print(input.mean((0, 1)), input.min(), input.max())
+            #         input = np.uint8(np.clip((input + 1) * 127.5, 0, 255))
+            #         path = f"/home/zhaochuyang/Workspace/guided-diffusion/test/{name}_{i}.jpg"
+            #         cv2.imwrite(path, input)
+            
+            # save_image("x_t", x_t)
+            # save_image("x_c", x_c)
 
             if self.model_var_type in [
                 ModelVarType.LEARNED,
@@ -786,7 +853,9 @@ class GaussianDiffusion:
                 # Learn the variance using the variational bound, but don't let
                 # it affect our mean prediction.
                 frozen_out = th.cat([model_output.detach(), model_var_values], dim=1)
+   
                 terms["vb"] = self._vb_terms_bpd(
+                    # no matter what arguments model get, it will always return frozen_out
                     model=lambda *args, r=frozen_out: r,
                     x_start=x_start,
                     x_t=x_t,

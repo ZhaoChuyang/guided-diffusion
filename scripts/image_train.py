@@ -1,23 +1,26 @@
 """
 Train a diffusion model on images.
 """
-
+import os
 import argparse
 
 from guided_diffusion import dist_util, logger
-from guided_diffusion.image_datasets import load_data
+from guided_diffusion.image_datasets import load_data, load_dg_data
 from guided_diffusion.resample import create_named_schedule_sampler
+
 from guided_diffusion.script_util import (
     model_and_diffusion_defaults,
     create_model_and_diffusion,
     args_to_dict,
     add_dict_to_argparser,
 )
+
 from guided_diffusion.train_util import TrainLoop
 
 
 def main():
     args = create_argparser().parse_args()
+    print(vars(args))
 
     dist_util.setup_dist()
     logger.configure()
@@ -30,12 +33,20 @@ def main():
     schedule_sampler = create_named_schedule_sampler(args.schedule_sampler, diffusion)
 
     logger.log("creating data loader...")
-    data = load_data(
-        data_dir=args.data_dir,
-        batch_size=args.batch_size,
-        image_size=args.image_size,
-        class_cond=args.class_cond,
-    )
+    if args.dg:
+        data = load_dg_data(
+            root = args.data_dir,
+            envs = args.envs,
+            batch_size=args.batch_size,
+            image_size=args.image_size,
+        )
+    else:
+        data = load_data(
+            data_dir=args.data_dir,
+            batch_size=args.batch_size,
+            image_size=args.image_size,
+            class_cond=args.class_cond,
+        )
 
     logger.log("training...")
     TrainLoop(
@@ -68,10 +79,14 @@ def create_argparser():
         microbatch=-1,  # -1 disables microbatches
         ema_rate="0.9999",  # comma-separated list of EMA values
         log_interval=10,
-        save_interval=10000,
+        save_interval=1000,
         resume_checkpoint="",
         use_fp16=False,
         fp16_scale_growth=1e-3,
+        # DG Settings
+        dg=True,
+        envs=["cartoon", "photo", "sketch"],
+        conditional=False
     )
     defaults.update(model_and_diffusion_defaults())
     parser = argparse.ArgumentParser()
